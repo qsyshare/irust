@@ -1,0 +1,642 @@
+    use warp::Filter;
+    use serde::{Deserialize, Serialize};
+    use std::sync::{Arc, Mutex};
+    use aes::Aes256;
+    use block_modes::{BlockMode, Cbc};
+    use block_modes::block_padding::Pkcs7;
+    use rand::Rng;
+    use std::fs::{File};
+    use std::io::{Read, Write};
+    use base64::{engine::general_purpose, Engine as _};
+    use pbkdf2::pbkdf2;
+    use hmac::Hmac;
+    use sha2::Sha256;
+
+    type HmacSha256 = Hmac<Sha256>;
+    type Db = Arc<Mutex<Vec<Record>>>;
+
+    
+    #[derive(Deserialize, Serialize, Clone)]
+    struct Record {
+        free_email: String,
+        deadline: String,
+        remaining: String,
+        status: String,
+        note: String,
+    }
+
+    #[derive(Serialize)]
+    struct Stats {
+        email_count: usize,
+        status_count: usize,
+        deadline_count: usize,
+        remaining_count: usize,
+    }
+    
+
+    #[derive(Deserialize)]
+    struct InputRecord {
+        free_email: String,
+        deadline: String,
+        remaining: Option<String>, // 设为可选
+        status: String,
+        note: String,
+        password: String,
+    }
+
+    #[derive(Deserialize)]
+    struct QueryInput {
+        password: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ModifyInput {
+        index: usize,
+        password: String, // 添加密码字段
+    }
+
+    #[derive(Deserialize)]
+    struct EditInput {
+        index: usize,
+        free_email: String,
+        deadline: String,
+        remaining: String,
+        status: String,
+        note: String,
+        password: String,
+        new_note: String,
+    }
+
+    #[derive(Serialize)]
+    struct DisplayRecord {
+        index: usize,  // 原始索引
+        free_email: String,
+        deadline: String,
+        remaining: String,
+        status: String,
+        note: String,
+    }
+
+
+    
+    fn encrypt_data(data: &str, password: &str) -> String {
+        let salt = rand::thread_rng().r#gen::<[u8; 16]>();
+        let iv = rand::thread_rng().r#gen::<[u8; 16]>();
+
+        let mut key = [0u8; 32];
+        pbkdf2::<HmacSha256>(password.as_bytes(), &salt, 10000, &mut key);
+
+        let cipher = Cbc::<Aes256, Pkcs7>::new_from_slices(&key, &iv).unwrap();
+        let ciphertext = cipher.encrypt_vec(data.as_bytes());
+
+        let combined = [&salt[..], &iv[..], &ciphertext[..]].concat();
+        general_purpose::STANDARD.encode(&combined)
+    }
+
+    fn decrypt_data(data: &str, password: &str) -> Option<String> {
+        let decoded = general_purpose::STANDARD.decode(data).ok()?;
+        let (salt, rest) = decoded.split_at(16);
+        let (iv, encrypted_data) = rest.split_at(16);
+
+        let mut key = [0u8; 32];
+        pbkdf2::<HmacSha256>(password.as_bytes(), salt, 10000, &mut key);
+
+        let cipher = Cbc::<Aes256, Pkcs7>::new_from_slices(&key, iv).ok()?;
+        let decrypted_data = cipher.decrypt_vec(encrypted_data).ok()?;
+
+        Some(String::from_utf8_lossy(&decrypted_data).to_string())
+    }
+
+    fn save_to_file(path: &str, data: &Vec<Record>) {
+        let json = serde_json::to_string(data).unwrap();
+        let mut file = File::create(path).unwrap();
+        file.write_all(json.as_bytes()).unwrap();
+    }
+
+    fn load_from_file(path: &str) -> Vec<Record> {
+        if let Ok(mut file) = File::open(path) {
+            let mut json = String::new();
+            file.read_to_string(&mut json).unwrap();
+            serde_json::from_str(&json).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+
+
+    #[tokio::main]
+    async fn main() {
+        let initial_data = load_from_file("data.json");
+        let db: Db = Arc::new(Mutex::new(initial_data));
+        let db_filter = warp::any().map({
+            let db = db.clone();
+            move || db.clone()
+        });
+
+        let index = warp::path!("index")
+            .map(|| warp::reply::html(INDEX_HTML));
+
+
+            let get_stats = warp::path!("stats")
+            .and(warp::get())
+            .and(db_filter.clone())
+            .map(|db: Db| {
+                let db_lock = db.lock().unwrap();
+                let today = chrono::Local::now().naive_local().date();
+
+                let mut email_count = 0;
+                let mut status_count = 0;
+                let mut deadline_count = 0;
+                let mut remaining_count = 0;
+                
+                for record in db_lock.iter() {
+                    if !record.free_email.is_empty() {
+                        email_count += 1;
+                    }
+                
+                    if record.deadline.is_empty(){
+                        remaining_count += 1;
+                   }
+                
+                    if let Ok(deadline_date) = chrono::NaiveDate::parse_from_str(&record.deadline, "%Y-%m-%d") {
+                        if deadline_date < today {
+                            deadline_count += 1;
+                        } if deadline_date >= today {
+                            status_count += 1;
+                        }
+                    }
+                }
+                
+
+                warp::reply::json(&Stats {
+                    email_count,
+                    status_count,
+                    deadline_count,
+                    remaining_count,
+                })
+            });   
+
+
+
+        let add_record = warp::path!("add")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(db_filter.clone())
+            .map(|input: InputRecord, db: Db| {
+
+                
+                let encrypted_email = encrypt_data(&input.free_email, &input.password);
+                let encrypted_note = encrypt_data(&input.note, &input.password);
+
+                // 自动计算 remaining
+                let remaining = input.remaining.unwrap_or_else(|| {
+                    let deadline_date = chrono::NaiveDate::parse_from_str(&input.deadline, "%Y-%m-%d")
+                        .unwrap_or_else(|_| chrono::Local::now().naive_local().date());
+                    let today = chrono::Local::now().naive_local().date();
+                    let diff_days = (deadline_date - today).num_days();
+                    diff_days.to_string()
+                });
+
+                let record = Record {
+                    free_email: encrypted_email,
+                    deadline: input.deadline,
+                    remaining,
+                    status: input.status,
+                    note: encrypted_note,
+                };
+
+
+                let mut db_lock = db.lock().unwrap();
+                db_lock.push(record);
+                save_to_file("data.json", &db_lock);
+
+                warp::reply::json(&serde_json::json!({ "status": "ok" }))
+            });
+
+        let query_records = warp::path!("query")
+            .and(warp::get())
+            .and(warp::query::<QueryInput>())
+            .and(db_filter.clone())
+            .map(|query: QueryInput, db: Db| {
+                let db_lock = db.lock().unwrap();
+                let mut decrypted_records = Vec::new();
+
+                for (i, record) in db_lock.iter().enumerate() {
+                    if let (Some(email), Some(note)) = (
+                        decrypt_data(&record.free_email, &query.password),
+                        decrypt_data(&record.note, &query.password),
+                    ) {
+                        decrypted_records.push(DisplayRecord {
+                            index: i,
+                            free_email: email,
+                            deadline: record.deadline.clone(),
+                            remaining: record.remaining.clone(),
+                            status: record.status.clone(),
+                            note,
+                        });
+                    }
+                }
+                
+                warp::reply::json(&decrypted_records)
+            });
+
+            
+            let delete_record = warp::path!("delete")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(db_filter.clone())
+            .map(|input: ModifyInput, db: Db| {
+                let mut db_lock = db.lock().unwrap();
+        
+                if input.index < db_lock.len() {
+                    let record = &db_lock[input.index];
+        
+                    // 尝试用输入的密码解密该记录邮箱
+                    if decrypt_data(&record.free_email, &input.password).is_none() {
+                        return warp::reply::json(&serde_json::json!({ "status": "wrong_password" }));
+                    }
+        
+                    db_lock.remove(input.index);
+                    save_to_file("data.json", &db_lock);  // 保存修改后的数据
+                    return warp::reply::json(&serde_json::json!({ "status": "deleted" }));
+                }
+        
+                warp::reply::json(&serde_json::json!({ "status": "error" }))
+            });
+        
+        
+            let edit_record = warp::path!("edit")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(db_filter.clone())
+            .map(|input: EditInput, db: Db| {
+                let mut db_lock = db.lock().unwrap();
+                if input.index < db_lock.len() {
+                    let encrypted_email = encrypt_data(&input.free_email, &input.password);
+                    let encrypted_note = encrypt_data(&input.new_note, &input.password);
+        
+                    // 更新记录
+                    db_lock[input.index] = Record {
+                        free_email: encrypted_email,
+                        deadline: input.deadline,
+                        remaining: input.remaining,   // 保持原样或进行更新
+                        status: input.status,         // 更新状态
+                        note: encrypted_note,
+                    };
+                    save_to_file("data.json", &db_lock);  // 保存修改后的数据
+                    return warp::reply::json(&serde_json::json!({ "status": "edited" }));
+                }
+                warp::reply::json(&serde_json::json!({ "status": "error" }))
+            });
+        
+
+    
+        let routes = index
+        .or(add_record)
+        .or(query_records)
+        .or(delete_record)
+        .or(edit_record)
+        .or(get_stats);
+
+        warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+    }
+
+    const INDEX_HTML: &str = r#"
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>数据添加</title>
+        <style>
+    body {
+        font-family: Arial, sans-serif;
+        text-align: center;
+        margin-top: 20vh;
+        background-color: #f5f5f5;
+    }
+
+    #tab-buttons {
+        text-align: center;
+        margin: 20px 0;
+    }
+
+    #tab-buttons button {
+        padding: 10px 20px;
+        margin: 0 10px;
+        font-size: 16px;
+        cursor: pointer;
+        border: none;
+        border-bottom: 3px solid transparent;
+        background-color: #eee;
+    }
+
+    #tab-buttons button:hover {
+        background-color: #ddd;
+    }
+
+    #tab-buttons button.active {
+        border-bottom: 3px solid #333;
+        background-color: #ccc;
+    }   
+
+    #data-display {
+        display: flex;
+        justify-content: center;
+        gap: 40px;
+        font-size: 169px;
+        font-weight: bold;
+    }
+
+    .blue { color: blue; }
+    .green { color: green; }
+    .red { color: red; }
+    .orange { color: orange; }
+
+    /* 新增的样式 */
+    input {
+        width: 100%; /* 宽度设置为100% */
+        max-width: 300px; /* 最大宽度为300px */
+        padding: 8px;
+        margin: 10px 0;
+        font-size: 14px;
+        box-sizing: border-box; /* 保证内边距不影响整体宽度 */
+    }
+
+    button {
+        padding: 10px 20px;
+        background-color: #4CAF50;
+        color: white;
+        font-size: 16px;
+        border: none;
+        cursor: pointer;
+        border-radius: 4px;
+    }
+
+    button:hover {
+        background-color: #45a049;
+    }
+
+    table {
+    margin: 0 auto;
+    border-collapse: collapse;
+    width: 90%;
+}
+th, td {
+    border: 1px solid #ccc;
+    padding: 8px;
+    text-align: center;
+}
+tr:hover {
+    background-color: #f1f1f1;
+}
+
+
+</style>
+
+    </head>
+    <body>
+        
+        <div id="data-display">
+            <span id="email-count" class="stat blue">0</span>
+            <span id="status-count" class="stat green">0</span>
+            <span id="deadline-count" class="stat red">0</span>
+            <span id="remaining-count" class="stat orange">0</span>
+        </div>
+
+        <div id="tab-buttons">
+            <button onclick="showTab('add')">I</button>
+            <button onclick="showTab('query')">O</button>
+        </div>
+    <div id="add-tab">
+        <h2>增加数据</h2>
+        <form id="dataForm">
+            <input placeholder="免费邮箱" name="free_email"><br>
+            <input type="date" name="deadline"><br>
+            
+            <input placeholder="状态" name="status"><br>
+            <input placeholder="备注" name="note"><br>
+            <input placeholder="密码" type="password" name="password"><br>
+            <button type="submit">提交</button>
+        </form>
+    </div>
+
+    <div id="query-tab" style="display: none;">
+        <h2>查询记录</h2>
+        <form id="queryForm">
+            <input placeholder="请输入密码" type="password" name="password"><br>
+            <button type="submit">查询</button>
+        </form>
+        <div id="query-result"></div>
+    </div>
+        <script>
+
+            window.onload = async function () {
+            // 获取统计数据
+            const res = await fetch('/stats');
+            const stats = await res.json();
+
+            // 更新显示
+            document.getElementById("email-count").textContent = stats.email_count;
+            document.getElementById("status-count").textContent = stats.status_count;
+            document.getElementById("deadline-count").textContent = stats.deadline_count;
+            document.getElementById("remaining-count").textContent = stats.remaining_count;
+        };
+
+        function showTab(tab) {
+                document.getElementById("add-tab").style.display = tab === 'add' ? "block" : "none";
+                document.getElementById("query-tab").style.display = tab === 'query' ? "block" : "none";
+        }
+
+
+
+       async function deleteRecord(index) {
+            const password = prompt("请输入删除密码");
+            const res = await fetch('/delete', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    index: Number(index),  // 强制转换为数字
+                    password
+                })
+            });
+
+            const result = await res.json();
+            if (result.status === "deleted") {
+                alert("删除成功！");
+                location.reload();
+            } else if (result.status === "wrong_password") {
+                alert("密码错误！");
+            } else {
+                alert("删除失败！");
+            }
+        }
+
+       async function editRecord(index, currentDeadline, currentStatus, currentNote) {
+            const new_deadline = prompt("请输入新的截止时间：", currentDeadline);
+            const new_status = prompt("请输入新的状态：", currentStatus);
+            const new_note = prompt("请输入新的备注内容：", currentNote);
+            const password = prompt("请输入密码：");
+
+            // 获取原始记录（使用 index 去查找）
+            const res = await fetch('/query?' + new URLSearchParams({ password }));
+            const records = await res.json();
+            const record = records.find(r => r.index === index); // 用 find 而不是直接索引
+
+            if (!record) {
+                alert("找不到记录");
+                return;
+            }
+
+            const body = {
+                index,
+                free_email: record.free_email, // 明文
+                deadline: new_deadline,        // 更新后的截止时间
+                remaining: record.remaining,   // 保持原样
+                status: new_status,            // 更新后的状态
+                note: record.note,             // 明文旧备注（虽然后端不再用）
+                new_note,                      // 明文新备注
+                password
+            };
+
+            const editRes = await fetch('/edit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+
+            const result = await editRes.json();
+            if (result.status === "edited") {
+                alert("修改成功！");
+                queryForm.dispatchEvent(new Event('submit'));  // 刷新查询
+            } else {
+                alert("修改失败：" + (result.status || "未知错误"));
+            }
+        }
+
+
+
+
+            
+
+        const form = document.getElementById('dataForm');
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            // 获取表单数据
+            const data = Object.fromEntries(new FormData(form));
+
+            // 检查邮箱是否为空
+            if (!data.free_email.trim()) {
+                alert("邮箱不能为空！");
+                return; // 阻止表单提交
+            }
+
+            // 提交表单数据
+            const res = await fetch('/add', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            });
+
+            const result = await res.json();
+            alert('提交成功！');
+        });
+
+
+        const queryForm = document.getElementById('queryForm');
+        queryForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const data = Object.fromEntries(new FormData(queryForm));
+            const res = await fetch('/query?' + new URLSearchParams(data));
+            const records = await res.json();
+
+            // 统计逻辑
+            const today = new Date();
+            let emailCount = 0;
+            let statusCount = 0;
+            let deadlinePassedCount = 0;
+            let deadlineEmptyCount = 0;
+
+            records.forEach(record => {
+                if (record.free_email.trim() !== "") emailCount++;
+                if (record.deadline && record.deadline.trim() !== "") {
+                    //statusCount++;
+                    const deadlineDate = new Date(record.deadline);
+                   
+                     if (deadlineDate < today) {
+                            deadlinePassedCount++;
+                        } else if (deadlineDate >= today) {
+                            statusCount++;
+                            }   
+                } else {
+                    deadlineEmptyCount++;
+                }
+            });
+
+            // 更新统计显示
+            document.getElementById("email-count").textContent = emailCount;
+            document.getElementById("status-count").textContent = statusCount;
+            document.getElementById("deadline-count").textContent = deadlinePassedCount;
+            document.getElementById("remaining-count").textContent = deadlineEmptyCount;
+
+            // 显示表格记录
+            let resultHTML = '<table>';
+            resultHTML += '<tr><th>免费邮箱</th><th>截止时间</th><th>剩余时间</th><th>状态</th><th>备注</th></tr>';
+            records.forEach(record => {
+                const deadline = new Date(record.deadline);
+                const diffDays = Math.floor((deadline - today) / (1000 * 60 * 60 * 24));
+                let remainingStyle = "";
+                if (diffDays < 0) {
+                    remainingStyle = "color:red; font-weight:bold";
+                } else if (diffDays === 1) {
+                    remainingStyle = "color:orange; font-weight:bold";
+                }
+
+                resultHTML += `<tr>
+                    <td>${record.free_email}</td>
+                    <td>${record.deadline}</td>
+                    <td style="${remainingStyle}">${diffDays}</td>
+                    <td>${record.status}</td>
+                    <td>${record.note}</td>
+                    <td>
+                        <button class="delete-btn" data-index="${record.index}">删除</button>
+                        <button class="edit-btn" data-index="${record.index}">修改</button>
+                    </td>
+
+                </tr>`;
+            });
+
+
+            resultHTML += '</table>';
+            document.getElementById('query-result').innerHTML = resultHTML;
+
+            document.querySelectorAll('.delete-btn').forEach(btn => {
+                btn.addEventListener('click', async (e) => {
+                    const index = btn.dataset.index;
+                    await deleteRecord(index);
+                });
+    });
+
+        document.querySelectorAll('.edit-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                const index = btn.dataset.index;
+                const row = btn.closest("tr").children;
+
+                const currentDeadline = row[1].textContent;
+                const currentStatus = row[3].textContent;
+                const currentNote = row[4].textContent;
+
+                await editRecord(Number(index), currentDeadline, currentStatus, currentNote);
+            });
+        });
+
+
+        });
+    </script>
+
+    </body>
+    </html>
+    "#;

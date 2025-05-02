@@ -1,0 +1,21 @@
+终端安装信息：
+
+
+
+ Rust 后端有哪些框架？
+
+
+	Poem
+	新兴框架，受 Warp 和 Axum 启发，但更注重易用性。
+	提供了很多高级功能，比如 OpenAPI 支持、gRPC 等。
+	中文文档很全，对国人开发者友好。
+
+
+那好吧，我们就用Poem从头开始开发一个可读写的网站吧。
+	
+	【第 1 步：搭建 Poem 服务器】
+		
+		cargo new sharemail
+		
+		cd sharemail
+
